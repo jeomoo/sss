@@ -1,0 +1,38 @@
+[gd_scene load_steps=6 format=3]
+
+[ext_resource type="Script" path="res://mods/RTVCoop/Game/Types/Puppet.gd" id="1_script"]
+[ext_resource type="Script" path="res://Scripts/Hitbox.gd" id="2_hitbox"]
+[ext_resource type="Script" path="res://mods/RTVCoop/Game/Types/PuppetHurtbox.gd" id="3_character"]
+[ext_resource type="PackedScene" path="res://mods/RTVCoop/Scenes/PlayerModel.tscn" id="4_model"]
+
+[sub_resource type="CapsuleShape3D" id="CapsuleShape3D_hit"]
+radius = 0.4
+height = 1.8
+
+[sub_resource type="CapsuleShape3D" id="CapsuleShape3D_body"]
+radius = 0.35
+height = 1.8
+
+[node name="RemotePlayer" type="CharacterBody3D" groups=["Player"]]
+collision_layer = 2
+collision_mask = 0
+script = ExtResource("1_script")
+
+[node name="BodyCollider" type="CollisionShape3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.9, 0)
+shape = SubResource("CapsuleShape3D_body")
+
+[node name="PlayerModel" parent="." instance=ExtResource("4_model")]
+
+[node name="Hitbox" type="StaticBody3D" parent="." groups=["Player"]]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.9, 0)
+collision_layer = 64
+collision_mask = 0
+script = ExtResource("2_hitbox")
+type = "Torso"
+
+[node name="Character" type="Node3D" parent="Hitbox"]
+script = ExtResource("3_character")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Hitbox"]
+shape = SubResource("CapsuleShape3D_hit")
