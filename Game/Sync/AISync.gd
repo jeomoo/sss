@@ -40,6 +40,8 @@ const THREAT_WEIGHT := 1.0          # 위협 가중치 (거리점수 0~1 대비)
 const THREAT_PER_DAMAGE := 0.04     # 데미지 1당 위협 증가 (8뎀≈0.32)
 const THREAT_MAX := 1.5             # 위협 점수 상한 (거리 1.0보다 약간 큼 = 어그로가 거리 override 가능)
 const THREAT_MAX_RANGE := 200.0     # 거리점수 정규화 기준(AI 시야)
+const TARGET_ACQUIRE_RANGE := 90.0
+const TARGET_LOS_MASK := 67
 var _ai_threat: Dictionary = {}     # {ai_uuid: {peer_id: {"score":float, "t":float}}}
 
 const COOP_DOOR_OPEN_RANGE: float = 40.0
@@ -225,14 +227,11 @@ func _physics_process(delta: float) -> void:
 				var target_pos = state_A["pos"].lerp(state_B["pos"], t)
 				var target_rot_y = lerp_angle(state_A["rot"].y, state_B["rot"].y, t)
 				
-				# 미세 오차 실시간 보정 (Anti-Drift)
-				if ai.global_position.distance_squared_to(target_pos) > 9.0: # 3m 이상 오차가 발생하면 강제 동기화 (텔레포트)
-					ai.global_position = target_pos
-					ai.global_rotation.y = target_rot_y
-				else:
-					# 로컬 FSM이 스스로 이동하도록 허용하되, 호스트의 실제 위치로 부드럽게 끌어당겨 블렌딩 보정
-					ai.global_position = ai.global_position.lerp(target_pos, delta * 3.0)
-					ai.global_rotation.y = lerp_angle(ai.global_rotation.y, target_rot_y, delta * 5.0)
+				# The queue already interpolates between authoritative host samples.
+				# A second low-pass lerp makes remote AI trail the sample and then catch up,
+				# which looks like over-speed movement at long distance.
+				ai.global_position = target_pos
+				ai.global_rotation.y = target_rot_y
 			else:
 				# Fallback to standard lerp if queue is insufficient
 				var target = players.ai_targets.get(uuid)
@@ -981,6 +980,51 @@ func RefreshTargetPos(state: Dictionary) -> void:
 
 # v0.5: 위협 가중 타게팅. nearest 대신 (거리점수 + 위협점수) 최고 플레이어 선정.
 # 토글 off거나 AI uuid 없으면(가드 등) nearest로 폴백. AIHooks가 a(AI노드) 넘김.
+func _target_belongs_to_hit(hit: Object, target: Node) -> bool:
+	var node := hit as Node
+	while node != null:
+		if node == target:
+			return true
+		node = node.get_parent()
+	return false
+
+
+func _ai_eye_position(ai_node: Node) -> Vector3:
+	if ai_node == null:
+		return Vector3.ZERO
+	if "eyes" in ai_node and is_instance_valid(ai_node.eyes):
+		return ai_node.eyes.global_position
+	return ai_node.global_position + Vector3(0.0, 1.5, 0.0)
+
+
+func _target_has_clear_los(ai_node: Node, target: Node, target_cam: Vector3) -> bool:
+	if ai_node == null or target == null or not is_instance_valid(target):
+		return false
+	if not ai_node.has_method("get_world_3d"):
+		return false
+	var world = ai_node.get_world_3d()
+	if world == null:
+		return false
+	var query := PhysicsRayQueryParameters3D.create(_ai_eye_position(ai_node), target_cam)
+	query.collision_mask = TARGET_LOS_MASK
+	if ai_node is CollisionObject3D:
+		query.exclude = [(ai_node as CollisionObject3D).get_rid()]
+	var result: Dictionary = world.direct_space_state.intersect_ray(query)
+	if not result.has("collider"):
+		return false
+	return _target_belongs_to_hit(result.collider, target)
+
+
+func _can_ai_consider_target(ai_node: Node, target: Node, target_cam: Vector3, distance: float, threat_score: float) -> bool:
+	if target == null or not is_instance_valid(target):
+		return false
+	if distance > TARGET_ACQUIRE_RANGE and threat_score <= 0.0:
+		return false
+	if threat_score > 0.0 and distance <= THREAT_MAX_RANGE:
+		return true
+	return _target_has_clear_los(ai_node, target, target_cam)
+
+
 func GetBestTargetState(from: Vector3, ai_node: Node) -> Dictionary:
 	if not bool(Engine.get_meta("coop_threat_targeting", true)):
 		return GetNearestPlayerState(from)
@@ -994,22 +1038,31 @@ func GetBestTargetState(from: Vector3, ai_node: Node) -> Dictionary:
 	var is_local: bool = false
 	var local_ctrl: Node = players.GetLocalController() if players.has_method("GetLocalController") else null
 	if local_ctrl and local_ctrl.is_inside_tree() and not local_ctrl.get("isDead") and not _is_local_downed():
-		var s: float = _dist_score(from.distance_to(local_ctrl.global_position)) + THREAT_WEIGHT * _threat_for(ai_uuid, CoopAuthority.local_peer_id(), now)
-		if s > best_score:
-			best_score = s
-			best_peer = CoopAuthority.local_peer_id()
-			is_local = true
+		var local_dist: float = from.distance_to(local_ctrl.global_position)
+		var local_threat: float = _threat_for(ai_uuid, CoopAuthority.local_peer_id(), now)
+		if _can_ai_consider_target(ai_node, local_ctrl, gameData.cameraPosition, local_dist, local_threat):
+			var local_score: float = _dist_score(local_dist) + THREAT_WEIGHT * local_threat
+			if local_score > best_score:
+				best_score = local_score
+				best_peer = CoopAuthority.local_peer_id()
+				is_local = true
 	for id in players.remote_players:
 		var puppet: Node = players.remote_players[id]
 		if not is_instance_valid(puppet) or not puppet.is_inside_tree():
 			continue
 		if puppet.get("isDead") or puppet.get("isDowned"):
 			continue
-		var s: float = _dist_score(from.distance_to(puppet.global_position)) + THREAT_WEIGHT * _threat_for(ai_uuid, id, now)
-		if s > best_score:
-			best_score = s
-			best_peer = id
-			is_local = false
+		var puppet_dist: float = from.distance_to(puppet.global_position)
+		var puppet_threat: float = _threat_for(ai_uuid, id, now)
+		var cam: Vector3 = puppet.global_position + Vector3(0.0, 1.6, 0.0)
+		if "cameraPosition" in puppet:
+			cam = puppet.cameraPosition
+		if _can_ai_consider_target(ai_node, puppet, cam, puppet_dist, puppet_threat):
+			var puppet_score: float = _dist_score(puppet_dist) + THREAT_WEIGHT * puppet_threat
+			if puppet_score > best_score:
+				best_score = puppet_score
+				best_peer = id
+				is_local = false
 	if best_peer < 0:
 		return {}
 	return _state_for_peer(best_peer, is_local)
@@ -1350,7 +1403,7 @@ func BroadcastAISound(uuid: int, sound_type: int, full_auto: bool = false) -> vo
 		
 	ai.set_meta("_coop_force_local_play", false)
 	
-	# 생성된 오디오 노드들의 process_mode를 ALWAYS로 설정하여 클라이언트 사이드 재생 보장
+	# 생성된 오디오 노드의 process_mode를 ALWAYS로 설정하여 클라이언트 사이드 재생 보장
 	for child in ai.get_children():
 		if not child in old_root_children:
 			child.process_mode = Node.PROCESS_MODE_ALWAYS
@@ -1390,10 +1443,17 @@ func BroadcastAIDeath(uuid: int, pos: Vector3, rot: Vector3, direction: Vector3,
 			ss.ApplySlotDictToPickup(ai.secondary, secondary_dict)
 	_log("BroadcastAIDeath applying: uuid=%d dir=%s force=%.1f loot=%d lc=%s" % [uuid, str(direction), force, container_loot.size(), str(lc)])
 	ai.set_meta("_coop_death_from_broadcast", true)
-	if ai.animator:
-		ai.animator.callback_mode_process = AnimationMixer.ANIMATION_CALLBACK_MODE_PROCESS_IDLE
+	for child in ai.find_children("*", "AnimationMixer", true, false):
+		child.active = false
+		child.process_mode = Node.PROCESS_MODE_DISABLED
 	if ai.skeleton:
+		ai.skeleton.process_mode = Node.PROCESS_MODE_INHERIT # 부모의 비활성을 따르도록 복구
 		ai.skeleton.modifier_callback_mode_process = Skeleton3D.MODIFIER_CALLBACK_MODE_PROCESS_IDLE
+		# 모든 SkeletonIK3D 및 SkeletonModifier3D 노드를 정지 및 비활성화
+		for ik in ai.find_children("*", "SkeletonIK3D", true, false):
+			ik.stop()
+		for mod in ai.find_children("*", "SkeletonModifier3D", true, false):
+			mod.active = false
 	ai.Death(direction, force)
 	if ai.skeleton and "simulationTime" in ai.skeleton:
 		ai.skeleton.simulationTime = 999.0
@@ -1575,7 +1635,7 @@ func process_client_ai_tick(a: Node, delta: float) -> void:
 			a.LKL = a.global_position - a.global_transform.basis.z * 10.0
 		a.Spine(delta)
 		
-	# [RTVCoop] 클라이언트 측 캐릭터가 굳는 현상 방지를 위해 수동 advance 밀어주기
+	# [RTVCoop] 클라이언트 측 캐릭터가 굳는 현상 방지를 위 수동 advance 밀어주기
 	if animator.has_method("advance"):
 		animator.advance(delta)
 	if skeleton.has_method("advance"):

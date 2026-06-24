@@ -24,7 +24,7 @@ func _setup_hooks() -> void:
 
 
 
-# v0.5: 스폰 곱을 "스폰될 인원이 정해진 뒤"에 적용 (모드 불가지론). 이전엔 aispawner-_ready-pre(이른
+# v0.5: 스폰 곱을 "스폰될 인원이 정해진 ���"에 적용 (모드 불가지론). 이전엔 aispawner-_ready-pre(이른
 # 시점)에서 spawnPool만 곱했는데, ASO 등이 그 뒤 Initialize에서 spawnPool/spawnLimit를 자기 값으로
 # 덮어써 곱이 무효화됨(저무 발견). → initialize-post(vanilla·ASO 등 모든 Initialize 끝난 뒤)에 최종값을 곱함.
 # spawnPool(풀크기)·spawnLimit(활성상한) 둘 다 곱 → 어느 쪽이 binding이든 커버.
@@ -62,15 +62,13 @@ func _get_active_player_count() -> int:
 
 
 func _replace_aispawner_ready() -> void:
-	if CoopAuthority.is_active() and not CoopAuthority.is_host():
-		CoopHook.skip_super()
+	pass
 
 func _post_aispawner_ready() -> void:
 	pass
 
 func _replace_aispawner_initialize() -> void:
-	if CoopAuthority.is_active() and not CoopAuthority.is_host():
-		CoopHook.skip_super()
+	pass
 
 
 func _post_aispawner_initialize() -> void:
@@ -99,7 +97,9 @@ func _read_actual_equipment(agent: Node) -> Dictionary:
 	else:
 		variant["backpackRoll"] = 100
 	if agent.mesh:
-		var mat = agent.mesh.get_surface_override_material(0)
+		var mat = agent.mesh.material_override
+		if not mat:
+			mat = agent.mesh.get_surface_override_material(0)
 		if mat and mat.resource_path != "":
 			variant["clothingPath"] = mat.resource_path
 	return variant

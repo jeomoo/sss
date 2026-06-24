@@ -2,6 +2,7 @@ extends "res://mods/RTVCoop/HookKit/BaseHook.gd"
 
 
 const CoopAuthority = preload("res://mods/RTVCoop/Framework/CoopAuthority.gd")
+const HOST_RETARGET_INTERVAL := 0.25
 
 # GameData backup variables for host-side target injection/restoration
 var _gd_injected: bool = false
@@ -86,7 +87,19 @@ func _replace_ai_physics_process(delta: float) -> void:
 	if ai_sync == null:
 		return  # ai_sync 없으면 기본 GameData로 네이티브 실행
 
-	var target_state = ai_sync.GetBestTargetState(a.global_position, a)
+	if not (a.get("sensorActive") == true) or gameData.isDead:
+		return
+
+	var retarget_t: float = float(a.get_meta("_coop_retarget_t", 0.0)) - delta
+	var target_state: Dictionary = a.get_meta("_coop_retarget_state", {})
+	if retarget_t <= 0.0 or target_state.is_empty():
+		target_state = ai_sync.GetBestTargetState(a.global_position, a)
+		a.set_meta("_coop_retarget_state", target_state)
+		a.set_meta("_coop_retarget_t", HOST_RETARGET_INTERVAL)
+	else:
+		a.set_meta("_coop_retarget_t", retarget_t)
+		if ai_sync.has_method("RefreshTargetPos"):
+			ai_sync.RefreshTargetPos(target_state)
 	if target_state.is_empty():
 		return  # 유효 타겟 없으면 기본대로 실행
 
@@ -137,14 +150,23 @@ func _replace_ai_death(direction, force) -> void:
 	var a := CoopHook.caller()
 	if a == null or not CoopAuthority.is_active():
 		return
+
+	# 호스트/클라이언트/퍼펫 공통: 사망 시 모든 IK, 애니메이션 믹서, 뼈 모디파이어를 정지/제거하여 ragdoll 엉킴(치즈 현상) 원천 방지
+	for child in a.find_children("*", "AnimationMixer", true, false):
+		child.active = false
+		child.process_mode = Node.PROCESS_MODE_DISABLED
+	if a.skeleton:
+		a.skeleton.process_mode = Node.PROCESS_MODE_INHERIT # 부모의 비활성을 따르도록 복구
+		a.skeleton.modifier_callback_mode_process = Skeleton3D.MODIFIER_CALLBACK_MODE_PROCESS_IDLE
+		
+		# 모든 SkeletonIK3D 및 SkeletonModifier3D 노드를 정지 및 비활성화
+		for ik in a.find_children("*", "SkeletonIK3D", true, false):
+			ik.stop()
+		for mod in a.find_children("*", "SkeletonModifier3D", true, false):
+			mod.active = false
+
 	if a.get_meta("coop_puppet_mode", false):
 		return
-
-	# 호스트/클라이언트 공통: 사망 시 IK 및 애니메이션 콜백을 IDLE로 설정하여 ragdoll 엉킴(치즈 현상) 방지
-	if a.animator:
-		a.animator.callback_mode_process = AnimationMixer.ANIMATION_CALLBACK_MODE_PROCESS_IDLE
-	if a.skeleton:
-		a.skeleton.modifier_callback_mode_process = Skeleton3D.MODIFIER_CALLBACK_MODE_PROCESS_IDLE
 
 	if a.get_meta("_coop_death_from_broadcast", false):
 		a.remove_meta("_coop_death_from_broadcast")
@@ -229,7 +251,9 @@ func _read_actual_equipment(agent: Node) -> Dictionary:
 	else:
 		variant["backpackRoll"] = 100
 	if agent.mesh:
-		var mat = agent.mesh.get_surface_override_material(0)
+		var mat = agent.mesh.material_override
+		if not mat:
+			mat = agent.mesh.get_surface_override_material(0)
 		if mat and mat.resource_path != "":
 			variant["clothingPath"] = mat.resource_path
 	return variant
@@ -397,5 +421,3 @@ func _replace_ai_los_check(_target: Vector3) -> void:
 
 func _post_noop() -> void:
 	pass
-
-

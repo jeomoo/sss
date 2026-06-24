@@ -2,8 +2,8 @@ extends "res://mods/RTVCoop/Game/Sync/BaseSync.gd"
 
 # RTVCoop 자체 AI 스폰 및 Proximity 관리자 (AICoopSpawner.gd)
 
-const PROXIMITY_SPAWN_DIST: float = 200.0   # 스폰 활성화 반경 (m)
-const PROXIMITY_DESPAWN_DIST: float = 250.0 # 디스폰 반경 (m)
+const PROXIMITY_SPAWN_DIST: float = 100.0   # 스폰 활성화 반경 (m)
+const PROXIMITY_DESPAWN_DIST: float = 130.0 # 디스폰 반경 (m)
 const SCAN_INTERVAL: float = 1.5           # 스폰 체크 주기 (초)
 
 var _scan_timer: float = 0.0
@@ -48,7 +48,7 @@ func _on_peer_connected(id: int) -> void:
 	# 새로운 클라이언트에게 기존 스폰되어 있던 AI 리스트를 전송
 	for uuid in players_ref.world_ai:
 		var ai = players_ref.world_ai[uuid]
-		if is_instance_valid(ai) and not ai.get("dead", false):
+		if is_instance_valid(ai) and ai.is_inside_tree() and not ai.get("dead", false):
 			var type = "Wanderer"
 			if _spawned_ai.has(uuid):
 				var idx = _spawned_ai[uuid]["point_index"]
@@ -174,6 +174,12 @@ func _find_node_by_name(root: Node, target_name: String) -> Node:
 
 
 func _tick_proximity_spawning() -> void:
+	var spawner = _get_ai_spawner()
+	if spawner == null:
+		_spawn_points.clear()
+		_spawned_ai.clear()
+		return
+
 	var coop_inst := RTVCoop.get_instance()
 	var players_ref = coop_inst.players if coop_inst else null
 	if players_ref == null:
@@ -198,15 +204,16 @@ func _tick_proximity_spawning() -> void:
 	for uuid in _spawned_ai:
 		var data = _spawned_ai[uuid]
 		var ai_node = data["ai_node"]
-		if not is_instance_valid(ai_node) or ai_node.get("dead", false):
+		if not is_instance_valid(ai_node) or not ai_node.is_inside_tree() or ai_node.get("dead", false):
 			despawn_list.append(uuid)
 			continue
 		
 		var nearest_dist: float = INF
 		for p in player_nodes:
-			var d = ai_node.global_position.distance_to(p.global_position)
-			if d < nearest_dist:
-				nearest_dist = d
+			if is_instance_valid(p) and p.is_inside_tree():
+				var d = ai_node.global_position.distance_to(p.global_position)
+				if d < nearest_dist:
+					nearest_dist = d
 		
 		if nearest_dist > PROXIMITY_DESPAWN_DIST:
 			despawn_list.append(uuid)
@@ -216,10 +223,21 @@ func _tick_proximity_spawning() -> void:
 		var ai_node = data["ai_node"]
 		var point_idx = data["point_index"]
 		
-		# Cooldown 부여 (재소환 억제)
+		# Cooldown 부여 (재소환 억제 및 무한리필 방지)
 		var point_type = "Wanderer"
 		if point_idx >= 0 and point_idx < _spawn_points.size():
-			_spawn_points[point_idx]["cooldown"] = 30.0 # 30초 쿨다운
+			var is_dead: bool = (not is_instance_valid(ai_node)) or ai_node.get("dead", false)
+			
+			var new_cooldown: float = 0.0
+			if is_dead:
+				# 적이 처치된 경우: 동일 장소에서 즉시 보충되지 않도록 5~8분간 쿨다운 지정
+				new_cooldown = randf_range(300.0, 480.0)
+			else:
+				# 단순 플레이어 이격으로 인한 디스폰: 2~3분간 재소환 억제
+				new_cooldown = randf_range(120.0, 180.0)
+				
+			# 기존 쿨타임이 더 길면 축소시키지 않고 보존
+			_spawn_points[point_idx]["cooldown"] = max(_spawn_points[point_idx]["cooldown"], new_cooldown)
 			point_type = _spawn_points[point_idx]["type"]
 		
 		if is_instance_valid(ai_node) and not ai_node.get("dead", false):
@@ -254,16 +272,27 @@ func _tick_proximity_spawning() -> void:
 		
 		_spawned_ai.erase(uuid)
 
-	# 2. 스폰 검사 (플레이어와의 거리가 100m 이내이고 쿨다운이 끝난 지점 스폰)
+	# 2. 스폰 검사 (플레��어와의 거리가 100m 이내이고 쿨다운이 끝난 지점 스폰)
 	var spawner = _get_ai_spawner()
 	var ai_sync = _sync("ai")
 	if spawner == null or ai_sync == null:
 		return
 
-	# 현재 소환되어 있는 총 액티브 AI 갯수 상한 체크 (호스트 스포너의 spawnLimit 사용)
-	var active_limit: int = 15
-	if "spawnLimit" in spawner:
-		active_limit = int(spawner.spawnLimit)
+	# 동적 소환 한도 관리 (5~12마리 사이로 매 주기마다 유동적 조절되도록 보장)
+	if not has_meta("_dynamic_limit_timer"):
+		set_meta("_dynamic_limit_timer", 0.0)
+		set_meta("_dynamic_limit", randi_range(5, 12))
+	
+	var limit_timer = get_meta("_dynamic_limit_timer") + SCAN_INTERVAL
+	var active_limit = get_meta("_dynamic_limit")
+	
+	# 45초마다 새로운 적정 마릿수 목표(5~12) 롤링하여 스폰 비효율 및 과부하 방지
+	if limit_timer >= 45.0:
+		limit_timer = 0.0
+		active_limit = randi_range(5, 12)
+		set_meta("_dynamic_limit", active_limit)
+		print("[AICoopSpawner] Dynamic AI spawn limit rolled to: %d" % active_limit)
+	set_meta("_dynamic_limit_timer", limit_timer)
 	
 	var current_active: int = 0
 	for uuid in _spawned_ai:
@@ -274,6 +303,8 @@ func _tick_proximity_spawning() -> void:
 	if current_active >= active_limit:
 		return
 
+	# 후보군 인덱스 수집
+	var candidates: Array = []
 	for i in range(_spawn_points.size()):
 		var p = _spawn_points[i]
 		if p["cooldown"] > 0.0:
@@ -291,20 +322,74 @@ func _tick_proximity_spawning() -> void:
 		# 플레이어와의 최단 거리 검사
 		var nearest_dist: float = INF
 		for player in player_nodes:
-			var d = p["pos"].distance_to(player.global_position)
-			if d < nearest_dist:
-				nearest_dist = d
+			if is_instance_valid(player) and player.is_inside_tree():
+				var d = p["pos"].distance_to(player.global_position)
+				if d < nearest_dist:
+					nearest_dist = d
 
-		# 100m 이내로 들어왔을 때 스폰
-		if nearest_dist <= PROXIMITY_SPAWN_DIST:
-			_spawn_at_point(i)
-			current_active += 1
-			if current_active >= active_limit:
+		# 너무 가깝거나(35m 이내) 너무 먼 경우(100m 초과) 필터링하여 갑툭튀 차단
+		if nearest_dist >= 35.0 and nearest_dist <= PROXIMITY_SPAWN_DIST:
+			candidates.append(i)
+
+	# 특정 지역 쏠림 및 인덱스 편향 방지를 위해 후보지 셔플
+	candidates.shuffle()
+
+	# 야외(Wanderer) 지점의 압도적 개수로 인해 실내가 완전히 묻히는 것을 방지
+	# 대기열 정렬: 실내/엄폐 요충지(Guard, Hider) 후보 지점들을 앞으로 우선 배치
+	var sorted_candidates: Array = []
+	var outer_candidates: Array = []
+	for idx in candidates:
+		var p_type = _spawn_points[idx]["type"]
+		if p_type == "Guard" or p_type == "Hider":
+			sorted_candidates.append(idx)
+		else:
+			outer_candidates.append(idx)
+	sorted_candidates.append_array(outer_candidates)
+
+	# 결정된 동적 한도만큼 스폰 실행 (인접 지역 쏠림 및 중첩 스폰 원천 방지)
+	var spawned_positions_this_tick: Array = []
+	for point_idx in sorted_candidates:
+		if current_active >= active_limit:
+			break
+			
+		var p = _spawn_points[point_idx]
+		
+		# 이미 필드에 살아있는 다른 AI들과 너무 가까운지 검사 (최소 15m 거리 유지)
+		var too_close_to_alive: bool = false
+		for uuid in _spawned_ai:
+			var node = _spawned_ai[uuid]["ai_node"]
+			if is_instance_valid(node) and node.is_inside_tree() and not node.get("dead", false):
+				if p["pos"].distance_to(node.global_position) < 15.0:
+					too_close_to_alive = true
+					break
+		if too_close_to_alive:
+			continue
+
+		# 이번 틱에서 소환하기로 결정된 위치들과 너무 가까운지 검사 (최소 15m 거리 유지)
+		var too_close: bool = false
+		for pos in spawned_positions_this_tick:
+			if p["pos"].distance_to(pos) < 15.0:
+				too_close = true
 				break
+		if too_close:
+			continue
+			
+		_spawn_at_point(point_idx)
+		spawned_positions_this_tick.append(p["pos"])
+		current_active += 1
 
 
 func _spawn_at_point(point_idx: int) -> void:
 	var p = _spawn_points[point_idx]
+	
+	# 스폰 직후 해당 지점에 긴 재스폰 쿨다운(Cooldown) 부여하여 다차원적인 분산 보장
+	# 야외(Wanderer)는 스폰 지점이 너무 많아 쏠리기 쉬우므로 더 긴 3~5분 쿨다운을 적용하고,
+	# 실내/구석 요충지(Guard, Hider)는 1.5~3분의 빠른 재순환을 보장합니다.
+	if p["type"] == "Wanderer":
+		p["cooldown"] = randf_range(180.0, 300.0)
+	else:
+		p["cooldown"] = randf_range(90.0, 180.0)
+
 	var spawner = _get_ai_spawner()
 	var ai_sync = _sync("ai")
 	var coop_inst := RTVCoop.get_instance()

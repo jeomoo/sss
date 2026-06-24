@@ -1,0 +1,9 @@
+[configuration]
+
+entry_symbol = "rtv_coop_library_init"
+compatibility_minimum = "4.2"
+
+[libraries]
+
+windows.debug.x86_64 = "res://mods/RTVCoop/bin/rtv_coop.windows.debug.x86_64.dll"
+windows.release.x86_64 = "res://mods/RTVCoop/bin/rtv_coop.windows.release.x86_64.dll"
