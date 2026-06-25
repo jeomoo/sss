@@ -77,7 +77,7 @@ func _post_aispawner_initialize() -> void:
 
 
 func _replace_aispawner_physics(_delta: float) -> void:
-	if CoopAuthority.is_active() and not CoopAuthority.is_host():
+	if CoopAuthority.is_active():
 		CoopHook.skip_super()
 
 

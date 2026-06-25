@@ -116,6 +116,49 @@ func _players() -> Node:
 	return coop.players if coop else null
 
 
+func _get_local_player(players_ref: Node) -> Node:
+	if players_ref == null:
+		return null
+	if players_ref.has_method("GetLocalController"):
+		var p = players_ref.GetLocalController()
+		if is_instance_valid(p):
+			return p
+	for prop in ["controller", "character", "local_player"]:
+		if prop in players_ref:
+			var p = players_ref.get(prop)
+			if is_instance_valid(p):
+				return p
+	
+	var tree = get_tree()
+	if tree == null:
+		return null
+		
+	var players_in_group = tree.get_nodes_in_group("Player")
+	for p in players_in_group:
+		if is_instance_valid(p):
+			var is_remote := false
+			if "remote_players" in players_ref:
+				for r_id in players_ref.remote_players:
+					if players_ref.remote_players[r_id] == p:
+						is_remote = true
+						break
+			if not is_remote:
+				return p
+
+	var fallback_paths = [
+		"/root/Map/Core/Controller",
+		"/root/Map/Core/Controller/Character",
+		"/root/Map/Core/Player",
+		"/root/Map/Player"
+	]
+	for path in fallback_paths:
+		var p = tree.root.get_node_or_null(path)
+		if is_instance_valid(p):
+			return p
+			
+	return null
+
+
 func _slot_serializer() -> Node:
 	var coop := RTVCoop.get_instance()
 	return coop.get_sync("slot_serializer") if coop else null
@@ -397,8 +440,8 @@ func _try_spawn_agent(entry: Dictionary) -> bool:
 	if entry.has("aiTarget"):
 		players.ai_targets[uuid] = entry["aiTarget"]
 	ai_spawner.activeAgents += 1
-	if uuid >= players.next_ai_uuid:
-		players.next_ai_uuid = uuid + 1
+	if uuid >= players.get_meta("next_ai_uuid", 1000):
+		players.set_meta("next_ai_uuid", uuid + 1)
 
 	var asleep: bool = entry.get("asleep", false)
 	_deferred_activate(new_agent, spawn_type, entry.get("isSync", false), asleep)
@@ -580,10 +623,12 @@ func BroadcastForceRagdoll(uuid: int) -> void:
 		return
 	var ai = players_ref.world_ai.get(uuid, null)
 	if ai and is_instance_valid(ai):
-		if ai.skeleton and ai.skeleton.has_method("Activate"):
-			ai.skeleton.Activate(Vector3(0, 0, -1), 5.0)
-			if "simulationTime" in ai.skeleton:
-				ai.skeleton.simulationTime = 999.0
+		if ai.skeleton:
+			ai.skeleton.process_mode = Node.PROCESS_MODE_ALWAYS
+			if ai.skeleton.has_method("Activate"):
+				ai.skeleton.Activate(Vector3(0, 0, -1), 5.0)
+				if "simulationTime" in ai.skeleton:
+					ai.skeleton.simulationTime = 999.0
 		ai.set_meta("coop_ragdoll_forced", true)
 
 
@@ -774,8 +819,8 @@ func GenerateAiUuid() -> int:
 	var players := _players()
 	if players == null:
 		return 0
-	var u: int = players.next_ai_uuid
-	players.next_ai_uuid += 1
+	var u: int = players.get_meta("next_ai_uuid", 1000)
+	players.set_meta("next_ai_uuid", u + 1)
 	return u
 
 
@@ -796,7 +841,7 @@ func _nearest_player(from: Vector3, use_camera: bool) -> Vector3:
 	var best_dist: float = INF
 	var found: bool = false
 
-	var local_ctrl: Node = players.GetLocalController() if players.has_method("GetLocalController") else null
+	var local_ctrl: Node = _get_local_player(players)
 	# v0.13.21: 본인이 쓰러진 상태면 local target 후보 제외 (remote puppet downed 체크와 대칭).
 	if local_ctrl and local_ctrl.is_inside_tree() and not _is_local_downed():
 		var d: float = from.distance_squared_to(local_ctrl.global_position)
@@ -836,7 +881,7 @@ func GetNearestPlayerState(from: Vector3) -> Dictionary:
 	var best_peer: int = -1
 	var is_local: bool = false
 
-	var local_ctrl: Node = players.GetLocalController() if players.has_method("GetLocalController") else null
+	var local_ctrl: Node = _get_local_player(players)
 	# v0.13.21: 본인이 쓰러진 상태면 local target 후보 제외
 	if local_ctrl and local_ctrl.is_inside_tree() and not _is_local_downed():
 		var d: float = from.distance_squared_to(local_ctrl.global_position)
@@ -869,7 +914,7 @@ func _state_for_peer(best_peer: int, is_local: bool) -> Dictionary:
 	if players == null:
 		return {}
 	if is_local:
-		var local_ctrl: Node = players.GetLocalController() if players.has_method("GetLocalController") else null
+		var local_ctrl: Node = _get_local_player(players)
 		if local_ctrl == null:
 			return {}
 		return {
@@ -927,7 +972,7 @@ func RefreshTargetPos(state: Dictionary) -> void:
 	if players == null:
 		return
 	if state.get("is_local", true):
-		var lc: Node = players.GetLocalController() if players.has_method("GetLocalController") else null
+		var lc: Node = _get_local_player(players)
 		if lc and is_instance_valid(lc):
 			state["pos"] = lc.global_position
 			state["cam"] = gameData.cameraPosition
@@ -1003,7 +1048,8 @@ func _target_has_clear_los(ai_node: Node, target: Node, target_cam: Vector3) -> 
 	if not ai_node.has_method("get_world_3d"):
 		return false
 	var world = ai_node.get_world_3d()
-	if world == null:
+	# [FIX] 월드맵 등 물리 공간이 완전히 준비되지 않았을 때의 Null 크래시 방지
+	if world == null or world.direct_space_state == null:
 		return false
 	var query := PhysicsRayQueryParameters3D.create(_ai_eye_position(ai_node), target_cam)
 	query.collision_mask = TARGET_LOS_MASK
@@ -1036,7 +1082,7 @@ func GetBestTargetState(from: Vector3, ai_node: Node) -> Dictionary:
 	var best_peer: int = -1
 	var best_score: float = -INF
 	var is_local: bool = false
-	var local_ctrl: Node = players.GetLocalController() if players.has_method("GetLocalController") else null
+	var local_ctrl: Node = _get_local_player(players)
 	if local_ctrl and local_ctrl.is_inside_tree() and not local_ctrl.get("isDead") and not _is_local_downed():
 		var local_dist: float = from.distance_to(local_ctrl.global_position)
 		var local_threat: float = _threat_for(ai_uuid, CoopAuthority.local_peer_id(), now)
@@ -1137,6 +1183,7 @@ func BroadcastAIPositions() -> void:
 	var strafe_dirs := PackedFloat32Array()
 	var ai_states := PackedInt32Array()
 	var target_positions := PackedVector3Array() # [4.2 동적 인지 변수 강제 주입]
+	var player_visibles := PackedByteArray()
 	
 	for uuid in players.world_ai:
 		var ai := _live_ai(uuid)
@@ -1184,14 +1231,15 @@ func BroadcastAIPositions() -> void:
 		strafe_dirs.append(ai.strafeDirection if "strafeDirection" in ai else 0.0)
 		ai_states.append(ai.currentState)
 		target_positions.append(target_pos)
+		player_visibles.append(1 if is_aware else 0)
 		
 	if uuids.is_empty():
 		return
-	BroadcastAIStates.rpc(uuids, positions, rotations, speeds, strafe_dirs, ai_states, target_positions)
+	BroadcastAIStates.rpc(uuids, positions, rotations, speeds, strafe_dirs, ai_states, target_positions, player_visibles)
 
 
 @rpc("authority", "unreliable_ordered", "call_remote")
-func BroadcastAIStates(uuids: Array, positions: PackedVector3Array, rotations: PackedVector3Array, speeds: PackedFloat32Array, strafe_dirs: PackedFloat32Array, states: PackedInt32Array, target_positions: PackedVector3Array) -> void:
+func BroadcastAIStates(uuids: Array, positions: PackedVector3Array, rotations: PackedVector3Array, speeds: PackedFloat32Array, strafe_dirs: PackedFloat32Array, states: PackedInt32Array, target_positions: PackedVector3Array, player_visibles: PackedByteArray) -> void:
 	var players := _players()
 	if players == null:
 		return
@@ -1204,10 +1252,13 @@ func BroadcastAIStates(uuids: Array, positions: PackedVector3Array, rotations: P
 		
 		# [6. 클라이언트 동기화] 호스트 의사결정 권위 유지 (Target Intent 로컬 주입)
 		if target_positions.size() > i:
-			# AI가 플레이어를 발견(playerVisible)했을 때만 타겟 위치를 주입합니다.
+			# AI가 플레이어를 발견(playerVisible)했는지 여부를 호스트 데이터에서 강제 주입합니다.
 			var is_aware = false
-			if ai.get("playerVisible") == true:
+			if player_visibles.size() > i and player_visibles[i] == 1:
 				is_aware = true
+				
+			if "playerVisible" in ai:
+				ai.playerVisible = is_aware
 				
 			if is_aware:
 				if "targetPosition" in ai: ai.targetPosition = target_positions[i]
@@ -1358,7 +1409,7 @@ func BroadcastAISound(uuid: int, sound_type: int, full_auto: bool = false) -> vo
 			# [RTVCoop] 클라이언트 사이드 총구 화염(Muzzle Flash) 복원
 			if ai.has_method("MuzzleVFX"):
 				if "_gs_dist_to_cam_sq" in ai:
-					var local_player = _players().GetLocalController() if _players() else null
+					var local_player = _get_local_player(_players()) if _players() else null
 					if local_player:
 						ai._gs_dist_to_cam_sq = ai.global_position.distance_squared_to(local_player.global_position)
 				ai.MuzzleVFX()
@@ -1443,17 +1494,36 @@ func BroadcastAIDeath(uuid: int, pos: Vector3, rot: Vector3, direction: Vector3,
 			ss.ApplySlotDictToPickup(ai.secondary, secondary_dict)
 	_log("BroadcastAIDeath applying: uuid=%d dir=%s force=%.1f loot=%d lc=%s" % [uuid, str(direction), force, container_loot.size(), str(lc)])
 	ai.set_meta("_coop_death_from_broadcast", true)
+	# [FIX] 레그돌 늘어남 방지: 애니메이션 틱 즉시 중단 (process_client_ai_tick이 다음 프레임에 이미 dead를 체크하지만
+	# Activate() 이후 한 프레임 더 advance()가 실행되면 bone transform이 꼬여 늘어남 발생)
+	ai.set_meta("coop_client_anim_ready", false)
 	for child in ai.find_children("*", "AnimationMixer", true, false):
 		child.active = false
 		child.process_mode = Node.PROCESS_MODE_DISABLED
 	if ai.skeleton:
-		ai.skeleton.process_mode = Node.PROCESS_MODE_INHERIT # 부모의 비활성을 따르도록 복구
+		# [FIX] 레그돌 늘어남 방지: Ragdoll 전에 Skeleton의 modifier_callback_mode를 DISABLED로 먼저 끊어 IK가 Bone에 끼어드는 것을 차단
 		ai.skeleton.modifier_callback_mode_process = Skeleton3D.MODIFIER_CALLBACK_MODE_PROCESS_IDLE
 		# 모든 SkeletonIK3D 및 SkeletonModifier3D 노드를 정지 및 비활성화
 		for ik in ai.find_children("*", "SkeletonIK3D", true, false):
 			ik.stop()
 		for mod in ai.find_children("*", "SkeletonModifier3D", true, false):
 			mod.active = false
+		# [FIX] PhysicalBone3D들도 ALWAYS로 설정해야 ragdoll 물리가 비활성화 트리 아래서도 작동
+		for pb in ai.find_children("*", "PhysicalBone3D", true, false):
+			pb.process_mode = Node.PROCESS_MODE_ALWAYS
+		# Skeleton 자체는 물리 시뮬레이션을 위해 ALWAYS 유지
+		ai.skeleton.process_mode = Node.PROCESS_MODE_ALWAYS
+		
+		# [FIX] Ragdoll 기동 전 Skeleton의 Pose를 Rest 위치로 초기화하여 IK/애니메이션 잔상에 의한 뼈 늘어남 방지
+		ai.skeleton.reset_bone_poses()
+		
+		# 클라이언트 측 즉시 Ragdoll 기동 및 충격 벡터(Impulse) 전파
+		if ai.skeleton.has_method("Activate"):
+			ai.skeleton.Activate(direction, force)
+		else:
+			ai.skeleton.physical_bones_start_simulation()
+	# [FIX] Death() 내부에서 skeleton.Activate()가 이중 호출되어 ragdoll이 초기화될 수 있으므로
+	# _coop_death_from_broadcast 플래그가 이미 세워진 뒤 Death() 호출 — 내부에서 죽음 hook이 skip_super함
 	ai.Death(direction, force)
 	if ai.skeleton and "simulationTime" in ai.skeleton:
 		ai.skeleton.simulationTime = 999.0
@@ -1584,6 +1654,8 @@ func on_host_ai_death(a: Node, direction, force) -> void:
 
 
 func process_client_ai_tick(a: Node, delta: float) -> void:
+	if a == null or not is_instance_valid(a) or a.get("dead") == true:
+		return
 	var animator: AnimationMixer = a.animator if "animator" in a else null
 	var skeleton: Skeleton3D = a.skeleton if "skeleton" in a else null
 	if animator == null or skeleton == null:

@@ -48,7 +48,7 @@ func _on_peer_connected(id: int) -> void:
 	# 새로운 클라이언트에게 기존 스폰되어 있던 AI 리스트를 전송
 	for uuid in players_ref.world_ai:
 		var ai = players_ref.world_ai[uuid]
-		if is_instance_valid(ai) and ai.is_inside_tree() and not ai.get("dead", false):
+		if is_instance_valid(ai) and ai.is_inside_tree() and ai.get("dead") != true:
 			var type = "Wanderer"
 			if _spawned_ai.has(uuid):
 				var idx = _spawned_ai[uuid]["point_index"]
@@ -173,6 +173,49 @@ func _find_node_by_name(root: Node, target_name: String) -> Node:
 	return null
 
 
+func _get_local_player(players_ref: Node) -> Node:
+	if players_ref == null:
+		return null
+	if players_ref.has_method("GetLocalController"):
+		var p = players_ref.GetLocalController()
+		if is_instance_valid(p):
+			return p
+	for prop in ["controller", "character", "local_player"]:
+		if prop in players_ref:
+			var p = players_ref.get(prop)
+			if is_instance_valid(p):
+				return p
+	
+	var tree = get_tree()
+	if tree == null:
+		return null
+		
+	var players_in_group = tree.get_nodes_in_group("Player")
+	for p in players_in_group:
+		if is_instance_valid(p):
+			var is_remote := false
+			if "remote_players" in players_ref:
+				for r_id in players_ref.remote_players:
+					if players_ref.remote_players[r_id] == p:
+						is_remote = true
+						break
+			if not is_remote:
+				return p
+
+	var fallback_paths = [
+		"/root/Map/Core/Controller",
+		"/root/Map/Core/Controller/Character",
+		"/root/Map/Core/Player",
+		"/root/Map/Player"
+	]
+	for path in fallback_paths:
+		var p = tree.root.get_node_or_null(path)
+		if is_instance_valid(p):
+			return p
+			
+	return null
+
+
 func _tick_proximity_spawning() -> void:
 	var spawner = _get_ai_spawner()
 	if spawner == null:
@@ -187,13 +230,13 @@ func _tick_proximity_spawning() -> void:
 	
 	# 활성 플레이어 리스트 구성
 	var player_nodes: Array = []
-	var local_ctrl = players_ref.GetLocalController() if players_ref.has_method("GetLocalController") else null
-	if local_ctrl and is_instance_valid(local_ctrl) and not local_ctrl.get("isDead", false):
+	var local_ctrl = _get_local_player(players_ref)
+	if local_ctrl and is_instance_valid(local_ctrl) and local_ctrl.get("isDead") != true:
 		player_nodes.append(local_ctrl)
 	
 	for id in players_ref.remote_players:
 		var puppet = players_ref.remote_players[id]
-		if is_instance_valid(puppet) and not puppet.get("isDead", false) and not puppet.get("isDowned", false):
+		if is_instance_valid(puppet) and puppet.get("isDead") != true and puppet.get("isDowned") != true:
 			player_nodes.append(puppet)
 	
 	if player_nodes.is_empty():
@@ -204,7 +247,7 @@ func _tick_proximity_spawning() -> void:
 	for uuid in _spawned_ai:
 		var data = _spawned_ai[uuid]
 		var ai_node = data["ai_node"]
-		if not is_instance_valid(ai_node) or not ai_node.is_inside_tree() or ai_node.get("dead", false):
+		if not is_instance_valid(ai_node) or not ai_node.is_inside_tree() or ai_node.get("dead") == true:
 			despawn_list.append(uuid)
 			continue
 		
@@ -226,7 +269,7 @@ func _tick_proximity_spawning() -> void:
 		# Cooldown 부여 (재소환 억제 및 무한리필 방지)
 		var point_type = "Wanderer"
 		if point_idx >= 0 and point_idx < _spawn_points.size():
-			var is_dead: bool = (not is_instance_valid(ai_node)) or ai_node.get("dead", false)
+			var is_dead: bool = (not is_instance_valid(ai_node)) or ai_node.get("dead") == true
 			
 			var new_cooldown: float = 0.0
 			if is_dead:
@@ -240,9 +283,9 @@ func _tick_proximity_spawning() -> void:
 			_spawn_points[point_idx]["cooldown"] = max(_spawn_points[point_idx]["cooldown"], new_cooldown)
 			point_type = _spawn_points[point_idx]["type"]
 		
-		if is_instance_valid(ai_node) and not ai_node.get("dead", false):
+		if is_instance_valid(ai_node) and ai_node.get("dead") != true:
 			# AI를 풀(APool 또는 BPool)로 반환하여 재사용 (오브젝트 풀링)
-			var spawner = _get_ai_spawner()
+			# [FIX] 중복 선언된 spawner 로컬 변수 참조 수정 (상위 스코프 변수 사용)
 			if spawner:
 				var pool = spawner.BPool if point_type == "Boss" else spawner.APool
 				ai_node.reparent(pool)
@@ -273,31 +316,33 @@ func _tick_proximity_spawning() -> void:
 		_spawned_ai.erase(uuid)
 
 	# 2. 스폰 검사 (플레��어와의 거리가 100m 이내이고 쿨다운이 끝난 지점 스폰)
-	var spawner = _get_ai_spawner()
+	spawner = _get_ai_spawner()
 	var ai_sync = _sync("ai")
 	if spawner == null or ai_sync == null:
 		return
 
-	# 동적 소환 한도 관리 (5~12마리 사이로 매 주기마다 유동적 조절되도록 보장)
+	# 동적 소환 한도 관리 (스포너 기본 한도에 비례하도록 유동적 조절)
+	var base_limit = spawner.spawnLimit if "spawnLimit" in spawner and spawner.spawnLimit > 0 else 6
 	if not has_meta("_dynamic_limit_timer"):
 		set_meta("_dynamic_limit_timer", 0.0)
-		set_meta("_dynamic_limit", randi_range(5, 12))
+		var rand_limit = max(2, roundi(base_limit * randf_range(0.8, 1.3)))
+		set_meta("_dynamic_limit", rand_limit)
 	
 	var limit_timer = get_meta("_dynamic_limit_timer") + SCAN_INTERVAL
 	var active_limit = get_meta("_dynamic_limit")
 	
-	# 45초마다 새로운 적정 마릿수 목표(5~12) 롤링하여 스폰 비효율 및 과부하 방지
+	# 45초마다 새로운 적정 마릿수 목표 롤링하여 스폰 비효율 및 과부하 방지
 	if limit_timer >= 45.0:
 		limit_timer = 0.0
-		active_limit = randi_range(5, 12)
+		active_limit = max(2, roundi(base_limit * randf_range(0.8, 1.3)))
 		set_meta("_dynamic_limit", active_limit)
-		print("[AICoopSpawner] Dynamic AI spawn limit rolled to: %d" % active_limit)
+		print("[AICoopSpawner] Dynamic AI spawn limit rolled to: %d (base=%d)" % [active_limit, base_limit])
 	set_meta("_dynamic_limit_timer", limit_timer)
 	
 	var current_active: int = 0
 	for uuid in _spawned_ai:
 		var node = _spawned_ai[uuid]["ai_node"]
-		if is_instance_valid(node) and not node.get("dead", false):
+		if is_instance_valid(node) and node.get("dead") != true:
 			current_active += 1
 
 	if current_active >= active_limit:
@@ -327,8 +372,10 @@ func _tick_proximity_spawning() -> void:
 				if d < nearest_dist:
 					nearest_dist = d
 
-		# 너무 가깝거나(35m 이내) 너무 먼 경우(100m 초과) 필터링하여 갑툭튀 차단
-		if nearest_dist >= 35.0 and nearest_dist <= PROXIMITY_SPAWN_DIST:
+		# 너무 가깝거나 너무 먼 경우 필터링하여 갑툭튀 차단
+		# 야외(Wanderer)는 탁 트여있어 30m 이내 갑툭튀 방지, 실내/엄폐(Guard, Hider)는 15m까지 허용하여 건물내 스폰 보장
+		var min_dist = 30.0 if p["type"] == "Wanderer" else 15.0
+		if nearest_dist >= min_dist and nearest_dist <= PROXIMITY_SPAWN_DIST:
 			candidates.append(i)
 
 	# 특정 지역 쏠림 및 인덱스 편향 방지를 위해 후보지 셔플
@@ -358,7 +405,7 @@ func _tick_proximity_spawning() -> void:
 		var too_close_to_alive: bool = false
 		for uuid in _spawned_ai:
 			var node = _spawned_ai[uuid]["ai_node"]
-			if is_instance_valid(node) and node.is_inside_tree() and not node.get("dead", false):
+			if is_instance_valid(node) and node.is_inside_tree() and node.get("dead") != true:
 				if p["pos"].distance_to(node.global_position) < 15.0:
 					too_close_to_alive = true
 					break

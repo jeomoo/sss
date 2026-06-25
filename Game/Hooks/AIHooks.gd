@@ -4,6 +4,9 @@ extends "res://mods/RTVCoop/HookKit/BaseHook.gd"
 const CoopAuthority = preload("res://mods/RTVCoop/Framework/CoopAuthority.gd")
 const HOST_RETARGET_INTERVAL := 0.25
 
+# [FIX] 미선언된 gameData 참조 오류 해결을 위한 프리로드 구문 추가
+var gameData: Resource = preload("res://Resources/GameData.tres")
+
 # GameData backup variables for host-side target injection/restoration
 var _gd_injected: bool = false
 var _sv_gd_pp: Vector3 = Vector3.ZERO
@@ -144,30 +147,44 @@ func _post_ai_physics_process(_delta: float) -> void:
 				gd.playerVector = _sv_gd_pv
 				gd.isDead = _sv_gd_id
 				gd.isTrading = _sv_gd_it
+	
+	# [FIX] 문 통과 방지: 호스트 AI가 닫힌 문을 감지하면 velocity를 0으로 설정해 물리적으로 멈춤
+	# → Interactor()가 문을 열면 AI가 자연스럽게 다시 이동
+	if not CoopAuthority.is_host():
+		return
+	var b := CoopHook.caller()
+	if b == null or b.get("dead") or b.get_meta("coop_ai_asleep", false):
+		return
+	var fwd = b.get("forward") if "forward" in b else null
+	if fwd == null or not (fwd is RayCast3D) or not fwd.is_colliding():
+		return
+	var fwd_collider = fwd.get_collider()
+	if fwd_collider == null:
+		return
+	# collider의 owner가 Door이고 닫혀있으면 멈추기
+	var door_owner = fwd_collider.get_owner() if fwd_collider.has_method("get_owner") else null
+	if door_owner == null:
+		door_owner = fwd_collider.owner if "owner" in fwd_collider else null
+	# Godot에서는 fwd_collider가 Interactable 그룹에 속하는지로 판단 (Door CollisionShape)
+	if fwd_collider.is_in_group("Interactable"):
+		# door_owner가 isOpen == false인 Door인 경우만 멈춤
+		var is_door_closed: bool = false
+		if door_owner != null and "isOpen" in door_owner:
+			is_door_closed = not door_owner.isOpen
+		elif fwd_collider != null and "isOpen" in fwd_collider:
+			is_door_closed = not fwd_collider.isOpen
+		if is_door_closed:
+			# velocity를 0으로 설정 → AI가 문 앞에서 멈춤 (Interactor가 문을 열 때까지)
+			if "velocity" in b:
+				b.velocity = Vector3.ZERO
 
 
 func _replace_ai_death(direction, force) -> void:
 	var a := CoopHook.caller()
 	if a == null or not CoopAuthority.is_active():
 		return
-
-	# 호스트/클라이언트/퍼펫 공통: 사망 시 모든 IK, 애니메이션 믹서, 뼈 모디파이어를 정지/제거하여 ragdoll 엉킴(치즈 현상) 원천 방지
-	for child in a.find_children("*", "AnimationMixer", true, false):
-		child.active = false
-		child.process_mode = Node.PROCESS_MODE_DISABLED
-	if a.skeleton:
-		a.skeleton.process_mode = Node.PROCESS_MODE_INHERIT # 부모의 비활성을 따르도록 복구
-		a.skeleton.modifier_callback_mode_process = Skeleton3D.MODIFIER_CALLBACK_MODE_PROCESS_IDLE
-		
-		# 모든 SkeletonIK3D 및 SkeletonModifier3D 노드를 정지 및 비활성화
-		for ik in a.find_children("*", "SkeletonIK3D", true, false):
-			ik.stop()
-		for mod in a.find_children("*", "SkeletonModifier3D", true, false):
-			mod.active = false
-
 	if a.get_meta("coop_puppet_mode", false):
 		return
-
 	if a.get_meta("_coop_death_from_broadcast", false):
 		a.remove_meta("_coop_death_from_broadcast")
 		return
@@ -225,7 +242,7 @@ func _post_ai_initialize() -> void:
 			spawn_type = "Boss"
 		
 		var script = a.get_script()
-		print("[AIHooks] Auto-registered host spawn: uuid=%d, script=%s" % [uuid, script.resource_path if script else "unknown"])
+		print("[AIHooks] Auto-registered host spawn: uuid=%s, script=%s" % [str(uuid), script.resource_path if script else "unknown"])
 		
 		# 바닐라 AI: 즉시 장비 읽기 후 클라이언트에 브로드캐스트
 		var variant: Dictionary = _read_actual_equipment(a)
@@ -236,6 +253,13 @@ func _post_ai_initialize() -> void:
 	var manager = coop2.get_sync("coop_manager") if coop2 else null
 	if manager and manager.has_method("register_ai"):
 		manager.register_ai(a)
+	# [FIX] 공격 관통 방지: AI 초기화 시점에 fire RayCast3D의 collision_mask를 나중에 복원할 수 있도록 릴 데이터로 저장
+	if a.get("fire") and a.fire is RayCast3D:
+		if not a.fire.get_meta("coop_original_mask", -1) as int != -1:
+			a.fire.set_meta("coop_original_mask", a.fire.collision_mask)
+		if a.get("LOS") and a.LOS is RayCast3D:
+			if not a.LOS.get_meta("coop_original_mask", -1) as int != -1:
+				a.LOS.set_meta("coop_original_mask", a.LOS.collision_mask)
 
 
 
@@ -334,6 +358,12 @@ func _replace_ai_raycast() -> void:
 	if a.fire == null:
 		return
 
+	# [FIX] 공격 관통 방지: fire 레이캐스트의 collision_mask이 리셋된 경우 🔧 필요 시 백업에서 복원
+	var saved_mask: int = a.fire.get_meta("coop_original_mask", 0) as int
+	if saved_mask != 0 and a.fire.collision_mask != saved_mask:
+		push_warning("[RTVCoop] fire.collision_mask was reset for AI %s (expected %d, got %d) - restoring" % [a.name, saved_mask, a.fire.collision_mask])
+		a.fire.collision_mask = saved_mask
+
 	var accuracy_target: Vector3 = a.global_position - a.global_transform.basis.z * 10.0
 	if a.has_method("FireAccuracy"):
 		accuracy_target = a.FireAccuracy()
@@ -345,18 +375,34 @@ func _replace_ai_raycast() -> void:
 		var hitCollider = a.fire.get_collider()
 		if hitCollider != null:
 			if hitCollider.is_in_group("Player"):
-				var damage: float = a.weaponData.damage if "weaponData" in a and a.weaponData != null else 10.0
-				var penetration: float = a.weaponData.penetration if "weaponData" in a and a.weaponData != null else 0.0
-				if "boss" in a and a.boss:
-					damage *= 2.0
+				# [FIX] 공격 관통 방지: Player를 맞추기 전에 인스턴스트 LOS 레이캐스트로 건물/벽이 전자를 차단하는지 확인
+				var space_state = a.get_world_3d().direct_space_state if a.get_world_3d() else null
+				var hit_blocked: bool = false
+				if space_state:
+					var fire_origin: Vector3 = a.fire.global_position
+					var target_pos: Vector3 = hitCollider.global_position
+					var query = PhysicsRayQueryParameters3D.create(
+						fire_origin, target_pos,
+						a.fire.collision_mask,
+						[a, a.fire]
+					)
+					var result = space_state.intersect_ray(query)
+					# 결과가 있는데 트리거 hitCollider가 아니면 중간에 다른 물체가 말리는 것임 (원거리에서 밸 통과 방지)
+					if result and result.get("collider") != hitCollider:
+						hit_blocked = true
+				if not hit_blocked:
+					var damage: float = a.weaponData.damage if "weaponData" in a and a.weaponData != null else 10.0
+					var penetration: float = a.weaponData.penetration if "weaponData" in a and a.weaponData != null else 0.0
+					if "boss" in a and a.boss:
+						damage *= 2.0
 
-				# hitCollider가 Puppet인 경우 자체 함수 호출, 바닐라인 경우 자식 노드 호출
-				if hitCollider.has_method("WeaponDamage"):
-					hitCollider.WeaponDamage("Body", damage)
-				elif hitCollider.get_child_count() > 0 and hitCollider.get_child(0).has_method("WeaponDamage"):
-					hitCollider.get_child(0).WeaponDamage(damage, penetration)
-				else:
-					push_warning("[RTVCoop] hitCollider %s has no WeaponDamage method!" % hitCollider.name)
+					# hitCollider가 Puppet인 경우 자체 함수 호출, 바닐라인 경우 자식 노드 호출
+					if hitCollider.has_method("WeaponDamage"):
+						hitCollider.WeaponDamage("Body", damage)
+					elif hitCollider.get_child_count() > 0 and hitCollider.get_child(0).has_method("WeaponDamage"):
+						hitCollider.get_child(0).WeaponDamage(damage, penetration)
+					else:
+						push_warning("[RTVCoop] hitCollider %s has no WeaponDamage method!" % hitCollider.name)
 			else:
 				var hitPoint = a.fire.get_collision_point()
 				var hitNormal = a.fire.get_collision_normal()
